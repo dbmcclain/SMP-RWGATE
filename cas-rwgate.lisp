@@ -3,6 +3,15 @@
 ;; DM/RAL  02/17
 ;; -----------------------------------------------------
 
+(defpackage #:cas-rwgate
+  (:use #:common-lisp)
+  (:export
+   #:make-rwgate
+   #:with-readlock
+   #:with-writelock))
+
+(in-package #:cas-rwgate)
+
 ;; ---------------------------------------------------------------
 ;; This package implements a multiple-reader/single-writer lock
 ;; protocol using the amazing capabilities of the Reppy channels.
