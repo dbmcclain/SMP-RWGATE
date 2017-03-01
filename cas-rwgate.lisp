@@ -5,18 +5,24 @@
 
 (defpackage #:cas-rwgate
   (:use #:common-lisp)
+  (:import-from #:mcas
+   #:car-ref
+   #:cdr-ref
+   #:mcas-read
+   #:mcas)
   (:export
    #:make-rwgate
    #:with-readlock
-   #:with-writelock))
+   #:with-writelock
+   ))
 
 (in-package #:cas-rwgate)
 
 ;; ---------------------------------------------------------------
-;; This package implements a multiple-reader/single-writer lock
-;; protocol using the amazing capabilities of the Reppy channels.
+;; This package implements an SMP-safe multiple-reader/single-writer
+;; lock protocol.
 ;;
-;; Rule of engagement:
+;; Rules of engagement:
 ;;
 ;; 1. A lock is available for reading if:
 ;;      (a) no write locks are in place, or
@@ -38,27 +44,59 @@
 ;;
 ;; ---------------------------------------------------------------
 
+(defstruct (rwgate
+            (:constructor %make-rwgate))
+  hdref
+  tlref)
+
 (defun make-rwgate ()
-  (cons nil 0))
+  (let ((cell (list 0)))
+    (%make-rwgate
+     ;; pre-allocate read-only refs
+     :hdref  (car-ref cell)
+     :tlref  (cdr-ref cell))))
 
 (defun rwg-cas (gate locktype)
-  (let ((new    (case locktype
+  (declare (rwgate gate)
+           (optimize (speed 3) (safety 0) (float 0)))
+  (let* ((new    (case locktype
                   (:read  t)
-                  (:write mp:*current-process*))))
-    (and (sys:compare-and-swap (car gate)
-                               (and (car gate)
-                                    new)
-                               new)
-         (sys:atomic-fixnum-incf (cdr gate)))
-    ))
+                  (:write mp:*current-process*)))
+         (hdref (rwgate-hdref gate))
+         (tlref (rwgate-tlref gate))
+         (hd    (mcas-read hdref))
+         (tl    (mcas-read tlref)))
+    (declare (fixnum hd))
+    (cond ((mcas `((,hdref ,hd  ,(1+ hd))
+                   (,tlref ,(and tl
+                                 new)  ,new)))
+           ;; we got it
+           )
+          
+          ((or (null tl)
+               (eq new tl))
+           ;; try again - we might have just failed on the count
+           (rwg-cas gate locktype))
+          )))
 
 (defun rwg-release (gate)
-  (when (zerop (sys:atomic-fixnum-decf (cdr gate)))
-    (setf (car gate) nil)))
+  (declare (rwgate gate)
+           (optimize (speed 3) (safety 0) (float 0)))
+  (let* ((hdref  (rwgate-hdref gate))
+         (tlref  (rwgate-tlref gate))
+         (hd     (mcas-read hdref))
+         (tl     (mcas-read tlref))
+         (new    (and (> hd 1)
+                      tl)))
+    (declare (fixnum hd))
+    (unless (mcas `((,hdref  ,hd  ,(1- hd))
+                    (,tlref  ,tl  ,new)))
+      (rwg-release gate))
+    ))
 
 ;; ------------------------------------------------------
 
-(defmacro safe-unwind-protect (form &rest unwind-clauses)
+(Defmacro safe-unwind-protect (form &rest unwind-clauses)
   `(mp:with-interrupts-blocked
     (unwind-protect
         (progn
