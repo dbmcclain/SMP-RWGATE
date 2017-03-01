@@ -19,6 +19,8 @@
 
 (in-package #:cas-rwgate)
 
+(declaim (optimize (speed 3) (safety 0) (float 0)))
+
 ;; ---------------------------------------------------------------
 ;; This package implements an SMP-safe multiple-reader/single-writer
 ;; lock protocol.
@@ -58,8 +60,7 @@
      :tlref  (cdr-ref cell))))
 
 (defun rwg-cas (gate locktype)
-  (declare (rwgate gate)
-           (optimize (speed 3) (safety 0) (float 0)))
+  (declare (rwgate gate))
   (let* ((new    (case locktype
                   (:read  t)
                   (:write mp:*current-process*)))
@@ -68,9 +69,8 @@
          (hd    (mcas-read hdref))
          (tl    (mcas-read tlref)))
     (declare (fixnum hd))
-    (cond ((mcas `((,hdref ,hd  ,(1+ hd))
-                   (,tlref ,(and tl
-                                 new)  ,new)))
+    (cond ((mcas hdref hd            (1+ hd)
+                 tlref (and tl new)  new)
            ;; we got it
            )
           
@@ -81,8 +81,7 @@
           )))
 
 (defun rwg-release (gate)
-  (declare (rwgate gate)
-           (optimize (speed 3) (safety 0) (float 0)))
+  (declare (rwgate gate))
   (let* ((hdref  (rwgate-hdref gate))
          (tlref  (rwgate-tlref gate))
          (hd     (mcas-read hdref))
@@ -90,8 +89,8 @@
          (new    (and (> hd 1)
                       tl)))
     (declare (fixnum hd))
-    (unless (mcas `((,hdref  ,hd  ,(1- hd))
-                    (,tlref  ,tl  ,new)))
+    (unless (mcas hdref  hd  (1- hd)
+                  tlref  tl  new)
       (rwg-release gate))
     ))
 

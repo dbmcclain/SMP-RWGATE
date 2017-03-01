@@ -15,8 +15,9 @@
    #:cdr-ref
    #:cas)
   (:export
+   #:%mcas
+   #:%mcas-triples
    #:mcas
-   #:mcas1
    #:mcas-read
    ))
 
@@ -69,14 +70,21 @@
 (defstruct mcas-desc
   triples status)
 
-(defun mcas (triples)
+(defun %mcas (triples)
   ;; triples - a sequence of (ref old new) suitable for CAS
   (mcas-help (make-mcas-desc
               :triples triples
               :status  (ref :undecided))))
 
-(defun mcas1 (ref old new)
-  (mcas `((,ref ,old ,new))))
+(defun %mcas-triples (&rest terms)
+  (let ((triples (um:group terms 3)))
+    `(list ,@(mapcar (lambda (triple)
+                       (destructuring-bind (place old new) triple
+                         `(list ,place ,old ,new)))
+                     triples))))
+
+(defmacro mcas (&rest terms)
+  `(%mcas ,(apply #'%mcas-triples terms)))
 
 (defun mcas-help (desc)
   (declare (mcas-desc desc))
