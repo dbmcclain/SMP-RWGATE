@@ -6,6 +6,7 @@
 (defpackage #:cas-rwgate
   (:use #:common-lisp)
   (:import-from #:mcas
+   #:ref
    #:car-ref
    #:cdr-ref
    #:mcas-read
@@ -50,7 +51,7 @@
   tlref)
 
 (defun make-rwgate ()
-  (let ((cell (list 0)))
+  (let ((cell (ref 0)))
     (%make-rwgate
      ;; pre-allocate read-only refs
      :hdref  (car-ref cell)

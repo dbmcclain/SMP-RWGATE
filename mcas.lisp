@@ -9,7 +9,7 @@
 (defpackage #:mcas
   (:use #:common-lisp)
   (:export
-   #:make-ref
+   #:ref
    #:car-ref
    #:cdr-ref
    #:ref-value
@@ -17,6 +17,8 @@
    #:mcas
    #:mcas1
    #:mcas-read
+   #:atomic-incf
+   #:atomic-decf
    ))
 
 (in-package #:mcas)
@@ -25,33 +27,59 @@
 
 ;; ====================================================================
 
-(defun make-ref (x)
-  (list x))
+(defclass ref-mixin ()
+  ((cell :reader ref-cell :initarg :cell)))
 
-(defun car-ref (x)
-  `(:car ,x))
+;; ----------------------------------------
 
-(defun cdr-ref (x)
-  `(:cdr ,x))
+(defclass car-ref (ref-mixin)
+  ())
 
-(defun ref-value (ref)
-  (declare (cons ref))
-  (optima:ematch ref
-    ((list _)          (car ref))
-    ((list :cdr place) (cdr (the cons place)))
-    ((list :car place) (car (the cons place)))
-    ((list* hd _)      hd)
-    ))
+(defmethod ref-value ((ref car-ref))
+  (car (ref-cell ref)))
 
-(defun cas (ref old new)
-  (declare (cons ref))
-  (optima:ematch ref
-    ((list _)          (system:compare-and-swap (car ref) old new))
-    ((list :cdr place) (system:compare-and-swap (cdr (the cons place)) old new))
-    ((list :car place) (system:compare-and-swap (car (the cons place)) old new))
-    ((list* _ _)       (system:compare-and-swap (car ref) old new))
-    ))
-    
+(defmethod cas ((ref car-ref) old new)
+  (system:compare-and-swap (car (ref-cell ref)) old new))
+
+(defmethod atomic-incf ((ref car-ref))
+  (system:atomic-fixnum-incf (car (ref-cell ref))))
+
+(defmethod atomic-decf ((ref car-ref))
+  (system:atomic-fixnum-decf (car (ref-cell ref))))
+
+;; -----------------------------------------
+
+(defclass ref (car-ref)
+  ())
+
+(defun ref (x)
+  (make-instance 'ref
+                 :cell (list x)))
+
+(defmethod car-ref ((ref ref))
+  ref)
+
+;; -----------------------------------------
+
+(defclass cdr-ref (ref-mixin)
+  ())
+
+(defmethod cdr-ref ((ref ref))
+  (make-instance 'cdr-ref
+                 :cell (ref-cell ref)))
+
+(defmethod ref-value ((ref cdr-ref))
+  (cdr (ref-cell ref)))
+
+(defmethod cas ((ref cdr-ref) old new)
+  (system:compare-and-swap (cdr (ref-cell ref)) old new))
+
+(defmethod atomic-incf ((ref cdr-ref))
+  (system:atomic-fixnum-incf (cdr (ref-cell ref))))
+
+(defmethod atomic-decf ((ref cdr-ref))
+  (system:atomic-fixnum-decf (cdr (ref-cell ref))))
+
 ;; ------------------
 ;; CCAS - Conditional CAS
 
@@ -59,7 +87,6 @@
   ref old new cond)
 
 (defun ccas (ref old new cond)
-  (declare (cons ref))
   (labels ((try-ccas (desc)
              (declare (ccas-desc desc))
              (cond ((cas ref old desc)
@@ -84,7 +111,6 @@
     (cas (ccas-desc-ref desc) desc new)))
 
 (defun ccas-read (ref)
-  (declare (cons ref))
   (let ((v (ref-value ref)))
     (cond ((ccas-desc-p v)
            (ccas-help v)
@@ -103,7 +129,7 @@
   ;; triples - a sequence of (ref old new) suitable for CAS
   (mcas-help (make-mcas-desc
               :triples triples
-              :status  (make-ref :undecided))))
+              :status  (ref :undecided))))
 
 (defun mcas1 (ref old new)
   (mcas `((,ref ,old ,new))))
@@ -157,7 +183,6 @@
       )))
           
 (defun mcas-read (ref)
-  (declare (cons ref))
   (let ((v (ccas-read ref)))
     (cond ((mcas-desc-p v)
            (mcas-help v)
