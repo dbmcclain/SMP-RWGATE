@@ -79,8 +79,8 @@
 (defun %mcas-triples (&rest terms)
   (let ((triples (um:group terms 3)))
     `(list ,@(mapcar (lambda (triple)
-                       (destructuring-bind (place old new) triple
-                         `(list ,place ,old ,new)))
+                       (destructuring-bind (ref old new) triple
+                         `(list ,ref ,old ,new)))
                      triples))))
 
 (defmacro mcas (&rest terms)

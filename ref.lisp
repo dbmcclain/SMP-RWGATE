@@ -3,6 +3,7 @@
 ;; DM/RAL  02/17
 ;; -------------------------------------------------------------
 
+#|
 (defpackage #:ref
   (:use #:common-lisp)
   (:export
@@ -11,9 +12,11 @@
    #:cdr-ref
    #:ref-value
    #:cas
+   #:mref
    #:atomic-incf
    #:atomic-decf
    ))
+|#
 
 (in-package #:ref)
    
@@ -35,13 +38,9 @@
 (defmethod cas ((ref car-ref) old new)
   (system:compare-and-swap (car (ref-cell ref)) old new))
 
-(defmethod atomic-incf ((ref car-ref))
-  (system:atomic-fixnum-incf (car (ref-cell ref))))
-
-(defmethod atomic-decf ((ref car-ref))
-  (system:atomic-fixnum-decf (car (ref-cell ref))))
-
 ;; -----------------------------------------
+;; REF - a mostly read-only indirect reference cell
+;; can only be mutated through CAS
 
 (defclass ref (car-ref)
   ())
@@ -52,6 +51,27 @@
 
 (defmethod car-ref ((ref ref))
   ref)
+
+;; ------------------------------------------
+;; MREF - mutable REF can be SETF directly
+
+(defclass mref (ref)
+  ())
+
+(defun mref (x)
+  (make-instance 'mref
+                 :cell (list x)))
+
+(defmethod set-ref-value ((ref mref) val)
+  (setf (car (ref-cell ref)) val))
+
+(defsetf ref-value set-ref-value)
+
+(defmethod atomic-incf ((ref mref))
+  (system:atomic-fixnum-incf (car (ref-cell ref))))
+
+(defmethod atomic-decf ((ref mref))
+  (system:atomic-fixnum-decf (car (ref-cell ref))))
 
 ;; -----------------------------------------
 

@@ -96,35 +96,25 @@
 
 ;; ------------------------------------------------------
 
-(Defmacro safe-unwind-protect (form &rest unwind-clauses)
-  `(mp:with-interrupts-blocked
-    (unwind-protect
-        (progn
-          (mp:current-process-unblock-interrupts)
-          ,form)
-      ,@unwind-clauses)))
-
-#+:LISPWORKS
-(editor:setup-indent "safe-unwind-protect" 1)
-
-;; ------------------------------------------------------
-
 (defun do-with-lock (have-lock gate locktype fn timeout abortfn)
   (if have-lock
       (funcall fn)
     ;; else
-    (labels ((ok-to-proceed ()
-               (rwg-cas gate locktype)))
-      
-      (if (or (ok-to-proceed)
-              (mp:wait-processing-events timeout
-                                         :wait-function #'ok-to-proceed))
-          (safe-unwind-protect
-              (funcall fn)
-            (rwg-release gate))
-        ;; else
-        (when abortfn
-          (funcall abortfn))
+    (let (has-lock)
+      (labels ((ok-to-proceed ()
+                 (mp:with-interrupts-blocked
+                   (setf has-lock (rwg-cas gate locktype)))))
+
+        (hcl:unwind-protect-blocking-interrupts-in-cleanups
+            (when (or (ok-to-proceed)
+                      (mp:wait-processing-events timeout
+                                                 :wait-function #'ok-to-proceed))
+              (funcall fn))
+          (if has-lock
+              (rwg-release gate)
+            ;; else
+            (when abortfn
+              (funcall abortfn))))
         ))))
 
 ;; --------------------------------------------------
