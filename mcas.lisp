@@ -26,24 +26,83 @@
 (declaim (optimize (speed 3) (safety 0) (float 0)))
 
 ;; -----------------------------------------------------------------
+;; AQCAS -- (Approximate Query CAS) A CAS with a returned value of the
+;; approximate contents of a ref before CAS success/failure
+
+#||#
+ ;; this version returns only an estimate of the prior ref contents
+(defun AQCAS (ref old new)
+  ;; approximate QCAS
+  (let ((sav  (ref-value ref)))
+    (cond ((cas ref old new)
+           (values t old)) ;; only time we actually know
+
+          ((eq sav old)
+           (aqcas ref old new)) ;; oops! try again
+
+          (t
+           (values nil sav)) ;; return our estimate
+          )))
+#||#
+;; -----------------------------------------------------------------
 ;; QCAS -- (Query CAS) A CAS with a returned value of the actual
 ;; contents of a ref before CAS success/failure
 
-(defun QCAS (ref old new)
-  (let (qold)
-    (hcl:unwind-protect-blocking-interrupts-in-cleanups
-        (progn
-          (loop until (cas ref
-                           (setf qold (ref-value ref))
-                           mp:*current-process*))
-          (cond ((eq qold old)
-                 (setf qold new)
-                 (values t old))
-                
-                (t
-                 (values nil qold))))
-      (cas ref mp:*current-process* qold))))
+(defvar +qcas-tryagain+  (gensym))
 
+(defstruct qcas
+  old new sav)
+
+(defun QCAS (ref old new)
+  (labels ((do-qcas ()
+             (let ((desc (make-qcas
+                          :old  old
+                          :new  new)))
+               (with-accessors ((sav qcas-sav)) desc
+                 (hcl:unwind-protect-blocking-interrupts-in-cleanups
+                     (progn
+                       (loop until (cas ref (setf sav (ref-value ref)) desc))
+                       (qcas-help desc))
+                   (cas ref desc sav))
+                 ))))
+    
+    (multiple-value-bind (tf v)
+        (do-qcas)
+      (cond ((eq tf +qcas-tryagain+)
+             (qcas ref old new))
+            
+            (t
+             (values tf v))
+            ))))
+
+(defun qcas-help (desc)
+  (let ((old  (qcas-old desc))
+        (new  (qcas-new desc)))
+    (with-accessors ((sav qcas-sav)) desc
+      (cond ((eq sav old)
+             (setf sav new)
+             (values t old))
+            
+            ((qcas-p sav)
+             (multiple-value-bind (tf v)
+                 (qcas-help sav)
+               (cond (tf
+                      (setf sav (qcas-sav sav))
+                      +qcas-tryagain+)
+                     
+                     ((eq old v)
+                      (setf sav new)
+                      (values t old))
+                     
+                     (t
+                      (setf sav (qcas-sav sav))
+                      (values nil v))
+                     )))
+            
+            (t
+             (values nil sav))
+            ))))
+               
 ;; ------------------
 ;; CCAS - Conditional CAS
 ;;
@@ -76,7 +135,7 @@
   (labels ((try-ccas (desc)
              (declare (ccas-desc desc))
              (multiple-value-bind (t/f v)
-                 (qcas ref old desc)
+                 (aqcas ref old desc)
                (cond (t/f
                       ;;
                       ;;               CAS succeeded
@@ -174,8 +233,7 @@
                (multiple-value-bind (t/f v)
                    (ccas ref old desc)
                  (unless t/f
-                   (cond ((or (eq v old)
-                              (eq v desc))
+                   (cond ((eq v desc))
                           ;; break
                           )
                          
@@ -192,12 +250,13 @@
                          ))
                  )))
 
-      (map nil (lambda (triple)
-                 (apply #'acquire triple))
-           triples)
+      (when (eq :undecided (car status-ref))
+        (map nil (lambda (triple)
+                   (apply #'acquire triple))
+             triples))
       (decide :successful)
       )))
-          
+
 (defun mcas-read (ref)
   (let ((v (ccas-read ref)))
     (cond ((mcas-desc-p v)
@@ -207,3 +266,28 @@
           (t  v)
           )))
 
+
+#|
+(progn
+  (defun tstx (&optional (n 1000000))
+    (let ((a  (ref 1))
+          (b  (ref 2))
+          (ct 0))
+      (rch:spawn (lambda ()
+                   (loop repeat n do
+                         (loop until (mcas a 1 3
+                                           b 2 4))
+                         (incf ct)
+                         (mcas a 3 5
+                               b 4 6))))
+      (loop repeat n do
+            (loop until (mcas a 5 7
+                              b 6 8))
+            (incf ct)
+            (mcas a 7 1
+                  b 8 2))
+      ct))
+) ;; progn
+|#
+
+  
