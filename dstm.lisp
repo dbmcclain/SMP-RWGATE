@@ -22,12 +22,18 @@
    #:open-for-write
    #:release-read
    #:abort-transaction
-   #:rollback
+   #:retry
    #:clone
    ))
 |#
 
 (in-package #:dstm)
+
+(declaim (inline tstate cas-state
+                 locator-new locator-old locator-trans
+                 ro-ent-var ro-ent-val ro-ent-refct
+                 transaction-ro-table transaction-state)
+         (optimize (speed 3) (safety 0) (float 0)))
 
 ;; ----------------------------------------------------
 
@@ -36,27 +42,35 @@
 (defstruct transaction
   ro-table
   dly-table
-  (state (ref :active)))
+  (state  (list :active)))
 
-(defvar *ncomms*  0)  ;; cumm nbr successful commits
-(defvar *nrolls*  0)  ;; cumm nbr rollbacks
+(defun tstate (trans)
+  (car (transaction-state trans)))
+
+(defun cas-state (trans old new)
+  (sys:compare-and-swap (car (transaction-state trans)) old new))
 
 ;; ----------------------------------------------------
 
-(define-condition rollback-exn ()
+(defvar *ncomms*  0)  ;; cumm nbr successful commits
+(defvar *nrolls*  0)  ;; cumm nbr retrys
+
+;; ----------------------------------------------------
+
+(define-condition retry-exn ()
   ())
 
 (define-condition abort-exn ()
   ((arg  :reader abort-exn-retval :initarg :retval :initform nil)))
 
 (defun dstm-error (exn)
-  (cas (transaction-state *current-transaction*) :active :aborted)
+  (cas-state *current-transaction* :active :aborted)
   (error exn))
 
-(defun rollback ()
+(defun retry ()
   (sys:atomic-fixnum-incf *nrolls*)
   (dstm-error (load-time-value
-               (make-condition 'rollback-exn)
+               (make-condition 'retry-exn)
                t)))
 
 (defun abort-transaction (&optional retval)
@@ -72,128 +86,15 @@
 
 (defvar *permanently-committed*
   (make-transaction
-   :state (ref :committed)))
+   :state (list :committed)))
 
-(defclass locator ()
-  ((new   :accessor val-new        :initarg :new   :initform nil)
-   (old   :accessor val-old        :initarg :old   :initform nil)
-   (trans :accessor val-trans      :initarg :trans :initform *permanently-committed*)
-   ))
+(defstruct locator
+  new old
+  (trans  *permanently-committed*))
 
 (defun make-var (&optional val)
-  (ref (make-instance 'locator
-                      :new  val)))
-
-;; ----------------------------------------------------
-
-(defun should-abort (var)
-  (let* ((entry (or (find var (transaction-dly-table *current-transaction*)
-                          :key  #'first
-                          :test #'eq)
-                    (let ((ent (list var 0.001)))
-                      (push ent (transaction-dly-table *current-transaction*))
-                      ent)
-                    ))
-         (dly  (second entry)))
-    (if (< dly 0.1)
-        (progn
-          ;; be nice...
-          (sleep (random dly))
-          (setf (second entry) (* dly 1.618))
-          nil)
-      ;; else
-      (progn
-        ;; no more Mr. Nice Guy...
-        (sleep (random dly))
-        t))
-    ))
-
-(defun add-to-read-only-table (var val trans)
-  (um:if-let (entry (find var (transaction-ro-table *current-transaction*)
-                          :key  #'first
-                          :test #'eq))
-      (progn
-        (unless (eq val (second entry))
-          (rollback))
-        (unless (eq :write (third entry))
-          (incf (the fixnum (third entry)))))
-    ;; else
-    (let ((ct  (if (eq trans *current-transaction*)
-                   :write
-                 1)))
-      (push (list var val ct) (transaction-ro-table *current-transaction*)))
-    ))
-
-(defun get-committed-val (var)
-  (let* ((loc   (ref-value var))
-         (trans (val-trans loc)))
-    (case (ref-value (transaction-state trans))
-      (:committed
-       (setf (val-old loc) nil) ;; help GC
-       (values (val-new loc) loc))
-      
-      (:aborted
-       (setf (val-new loc) nil) ;; help GC
-       (values (val-old loc) loc))
-      
-      (:active     (cond ((eq trans *current-transaction*)
-                          (values (val-old loc) loc))
-
-                         ((should-abort var)
-                          ;; abort him and try again
-                          (cas (transaction-state trans) :active :aborted)
-                          (get-committed-val var))
-
-                         (t
-                          ;; try again
-                          (get-committed-val var))
-                         ))
-      )))
-
-(defun validate-read-only-table ()
-  ;; check that all vars opened for reading remain unchanged
-  (unless (every #'(lambda (triple)
-                     (eq (second triple)
-                         (get-committed-val (first triple))))
-                 (transaction-ro-table *current-transaction*))
-    (rollback)))
-
-(defun validate-transaction ()
-  ;; check vars opened for reading and that we are still active
-  (validate-read-only-table)
-  (unless (eq :active (ref-value (transaction-state *current-transaction*)))
-    (rollback)))
-
-(defun open-for-read (var)
-  (multiple-value-bind (val loc)
-      (get-committed-val var)
-    (add-to-read-only-table var val (val-trans loc))
-    (validate-transaction)
-    val))
-
-(defun release-read (var)
-  ;; releasing a var that was never opened is a benign error
-  (um:when-let (entry (find var (transaction-ro-table *current-transaction*)
-                            :key  #'first
-                            :test #'eq))
-    (unless (or (eq :write (third entry))
-                (plusp (the fixnum (decf (the fixnum (third entry))))))
-      (setf (transaction-ro-table *current-transaction*)
-            (delete entry (transaction-ro-table *current-transaction*)
-                    :test #'eq)))
-    ))
-      
-(defun update-read-only-table-for-write (var val)
-  ;; if var has been opened for reading, mark it as now open for writing
-  ;; prevents release-read from doing anything
-  (um:when-let (entry (find var (transaction-ro-table *current-transaction*)
-                            :key  #'first
-                            :test #'eq))
-    (progn
-      (unless (eq val (second entry))
-        (rollback))
-      (setf (third entry) :write))
-    ))
+  (ref (make-locator
+        :new  val)))
 
 ;; ------------------------------
 ;; All objects subject to DSTM must define a DSTM:CLONE method
@@ -217,25 +118,157 @@
 (defmethod clone ((r mref))
   (mref (ref-value r)))
 
+;; ----------------------------------------------------
+
+(defstruct dly-ent
+  var dly)
+
+(defun should-abort (var)
+  (with-accessors ((dly-table  transaction-dly-table))
+      *current-transaction*
+    (let* ((entry (or (find var dly-table
+                            :key  #'dly-ent-var
+                            :test #'eq)
+                      (let ((ent (make-dly-ent
+                                  :var var
+                                :dly 0.001)))
+                        (push ent dly-table)
+                        ent)
+                      ))
+           (dly  (dly-ent-dly entry))
+           (rdly (random dly)))
+      (cond ((< dly 0.1)
+             ;; be nice...
+             (sleep rdly)
+             (setf (dly-ent-dly entry) (* dly 1.618))
+             nil) ;; say no to aborting...
+            
+            (t 
+             ;; no more Mr. Nice Guy...
+             (sleep rdly)
+             t) ;; go ahead and abort him
+            ))))
+
+;; -------------------------------------------------------------------------
+;; entry tuples in transaction ro-list
+
+(defstruct ro-ent
+  var val refct)
+
+(defun add-to-read-only-table (var val trans)
+  (with-accessors ((ro-table  transaction-ro-table))
+      *current-transaction*
+    (let ((entry  (find var ro-table
+                        :key  #'ro-ent-var
+                        :test #'eq)))
+      (cond (entry
+             ;; don't worry here about val v.s. our copy of it.
+             ;; we'll be checking consistency momentarily.
+             (unless (eq :write (ro-ent-refct entry))
+               (incf (the fixnum (ro-ent-refct entry)))))
+
+            (t 
+             (let ((ct (if (eq trans *current-transaction*)
+                           :write
+                         1)))
+               (push (make-ro-ent
+                      :var   var
+                      :val   val
+                      :refct ct)
+                     ro-table)))
+            ))))
+
+(defun update-read-only-table-for-write (var)
+  ;; if var has been opened for reading, mark it as now open for writing
+  ;; prevents release-read from doing anything
+  (um:when-let (entry (find var (transaction-ro-table *current-transaction*)
+                            :key  #'ro-ent-var
+                            :test #'eq))
+    (setf (ro-ent-refct entry) :write)))
+
+(defun validate-read-only-table ()
+  ;; check that all vars opened for reading remain unchanged
+  (unless (every #'(lambda (entry)
+                     (eq (ro-ent-val entry)
+                         (get-committed-val (ro-ent-var entry))))
+                 (transaction-ro-table *current-transaction*))
+    (retry)))
+
+;; -----------------------------------------------------------------
+
+(defun get-committed-val (var)
+  (let* ((loc   (ref-value var))
+         (trans (locator-trans loc)))
+    (case (tstate trans)
+      (:committed
+       (setf (locator-old loc) nil) ;; help GC
+       (values (locator-new loc) loc))
+      
+      (:aborted
+       (setf (locator-new loc) nil) ;; help GC
+       (values (locator-old loc) loc))
+      
+      (:active
+       (cond ((eq trans *current-transaction*)
+              (values (locator-old loc) loc))
+             
+             ((should-abort var)
+              ;; abort him and try again
+              (cas-state trans :active :aborted)
+              (get-committed-val var))
+             
+             (t
+              ;; try again
+              (get-committed-val var))
+             ))
+      )))
+
+(defun validate-transaction ()
+  ;; check vars opened for reading and that we are still active
+  (validate-read-only-table)
+  (unless (eq :active (tstate *current-transaction*))
+    (retry)))
+
+(defun open-for-read (var)
+  (multiple-value-bind (val loc)
+      (get-committed-val var)
+    (add-to-read-only-table var val (locator-trans loc))
+    (validate-transaction)
+    val))
+
+(defun release-read (var)
+  ;; releasing a var that was never opened is a benign error
+  (with-accessors ((ro-table  transaction-ro-table))
+      *current-transaction*
+  (um:when-let (entry (find var ro-table
+                            :key  #'ro-ent-var
+                            :test #'eq))
+    (unless (or (eq :write (ro-ent-refct entry))
+                (plusp (the fixnum (decf (the fixnum (ro-ent-refct entry))))))
+      (setf ro-table (delete entry ro-table
+                             :test  #'eq
+                             :count 1)))
+    )))
+      
 ;; ------------------------------
 
 (defun open-for-write (var)
   (multiple-value-bind (old loc)
       (get-committed-val var)
-    (cond ((eq (val-trans loc) *current-transaction*)
+    (cond ((eq (locator-trans loc) *current-transaction*)
            ;; already open-for-write by us
-           (val-new loc))
+           (locator-new loc))
 
           (t
            ;; try to grab with new locator
            (let* ((new     (clone old))
-                  (new-loc (make-instance 'locator
-                                          :new   new
-                                          :old   old
-                                          :trans *current-transaction*)))
+                  (new-loc (make-locator
+                            :new   new
+                            :old   old
+                            :trans *current-transaction*)))
              (cond ((cas var loc new-loc)
                     ;; we got it
-                    (update-read-only-table-for-write var old)
+                    (update-read-only-table-for-write var)
                     (validate-transaction)
                     new)
             
@@ -245,40 +278,56 @@
                    )))
           )))
 
+;; ------------------------------
+
 (defun commit ()
   ;; check that no read-only vars have changed and that we are still active
   (validate-read-only-table)
-  (unless (cas (transaction-state *current-transaction*) :active :committed)
-    (rollback))
+  (unless (cas-state *current-transaction* :active :committed)
+    (retry))
   ;; we made it
   (sys:atomic-fixnum-incf *ncomms*))
+
+;; ------------------------------
 
 (defun do-atomically (fn)
   (cond (*current-transaction*
          (funcall fn))
         
         (t
-         (handler-case
-             (loop
-              (let ((*current-transaction* (make-transaction)))
-                (handler-case
-                    (unwind-protect
-                        (return-from do-atomically
-                          (multiple-value-prog1
-                              (values (funcall fn) t)
-                            (commit)))
-                      ;; unwind - help GC
-                      (setf (transaction-ro-table *current-transaction*) nil
-                            (transaction-dly-table *current-transaction*) nil))
-                  
-                  (rollback-exn (exn)
-                    (declare (ignore exn))
-                    ;; try again from the top
-                    )
-                  )))
+         (labels ((try-transaction ()
+                    (with-accessors ((ro-table  transaction-ro-table)
+                                     (dly-table transaction-dly-table))
+                        *current-transaction*
+                      
+                      (unwind-protect
+                          (return-from do-atomically
+                            (multiple-value-prog1
+                                (values (funcall fn) t)
+                              (commit)))
+                        
+                        ;; unwind - help GC
+                        (setf ro-table  nil
+                              dly-table nil))
+                      ))
 
-           (abort-exn (exn)
-             (values (abort-exn-retval exn) nil))
+
+                  (retry-loop ()
+                    (let ((*current-transaction* (make-transaction)))
+                      (handler-case
+                          (try-transaction)
+                        (retry-exn (exn)
+                          (declare (ignore exn))
+                          ;; try again from the top
+                          (retry-loop))
+                        ))
+                    ))
+                    
+           (handler-case
+               (retry-loop)
+             (abort-exn (exn)
+               (values (abort-exn-retval exn) nil))
+             )
            ))
         ))
   
@@ -297,9 +346,9 @@
   (defun show-rolls (&optional (duration 1))
     (let ((pcnt (/ *nrolls* *ncomms* 0.01))
           (rate (/ *ncomms* duration)))
-      (list :rollbacks *nrolls*
+      (list :retrys *nrolls*
             :commits   *ncomms*
-            :percent-rollbacks pcnt
+            :percent-retrys pcnt
             :commits-per-roll (if (zerop pcnt) :infinite (* 100 (/ pcnt)))
             :duration duration
             :commits-per-sec  rate)))
@@ -316,7 +365,8 @@
       (setf a (car (open-for-read *a*))
             b (car (open-for-read *b*))
             ))
-    (unless (= b (* 2 a))
+    (if (= b (* 2 a))
+        (format t "~%a = ~A, b = ~A  (~A)" a b mp:*current-process*)
       (bfly:log-info :SYSTEM-LOG "Invariant broken: A = ~A, B = ~A" a b)))
   
   (defun common-code (delta)
@@ -332,10 +382,14 @@
   (defvar *ct* 1000)
   
   (defun count-up ()
-    (loop repeat *ct* do (common-code 1)))
+    (loop repeat *ct* do (common-code 1))
+    (check-invariant)
+    )
   
   (defun count-down ()
-    (loop repeat *ct* do (common-code -1)))
+    (loop repeat *ct* do (common-code -1))
+    (check-invariant)
+    )
   
   (defun checker (&rest procs)
     (let ((start (usec:get-time-usec)))
@@ -344,7 +398,7 @@
       (let ((stop (usec:get-time-usec)))
         (bfly:log-info :SYSTEM-LOG (show-rolls (* 1e-6 (- stop start))))) ))
   
-  (defun tst1 ()
+  (defun tst0 ()
     (bfly:log-info :SYSTEM-LOG "Start HDSTM Test...")
     (setf *a* (make-var (list 0))
           *b* (make-var (list 0)))
@@ -357,6 +411,18 @@
                                     (bfly:spawn #'count-up
                                                 :name :down-counter))))
     )
+  
+  (defun tst1 (&optional (ct 100000))
+    ;; only one thread for no-contention timings
+    (setf *ct* ct)
+    (setf *a* (make-var (list 0))
+          *b* (make-var (list 0)))
+    (reset)
+    (let ((start (usec:get-time-usec)))
+      (count-down)
+      (let ((stop (usec:get-time-usec)))
+        (show-rolls (* 1e-6 (- stop start))))
+      ))
   
   (defun tst2 (&optional (ct 100000))
     (setf *ct* ct)
@@ -383,7 +449,6 @@
       ))
 
   (defun tst3 (&optional (ct 100000))
-    ;; only one thread for no-contention timings
     (setf *ct* ct)
     (setf *a* (make-var (list 0))
           *b* (make-var (list 0)))
@@ -391,19 +456,25 @@
     (let ((start (usec:get-time-usec))
           (ct 0)
           (down (bfly:spawn-link #'count-down
-                                 :name :down-counter)))
-      (loop until (= 1 ct)
+                                 :name :down-counter))
+          (up   (bfly:spawn-link #'count-up
+                                 :name :up-counter))
+          (down2 (bfly:spawn-link #'count-down
+                                  :name :down-counter2)))
+      (loop until (= 3 ct)
             do
             (bfly:recv msg
-              ((list :exit-message pid _ _)
-               :when (eq pid down)
+              ((list :Exit-Message pid _ _)
+               :when (or (eq pid down)
+                         (eq pid up)
+                         (eq pid down2))
                (incf ct))
               ( _ )))
       
       (let ((stop (usec:get-time-usec)))
         (show-rolls (* 1e-6 (- stop start))))
       ))
-  
+
   ;; -------------------------------------------
 
   (defun tst4 ()
@@ -428,5 +499,3 @@
   
   ) ;; progn
 |#
-
-

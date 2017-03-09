@@ -395,9 +395,8 @@
   ;; Accept a list of clauses and execute them in parallel,
   ;; synchronizing at the closing paren.
   (if (rest clauses)
-      `(%par ,@(mapcar (lambda (clause)
-                         `(lambda ()
-                            ,clause))
+      `(%par ,@(mapcar #`(lambda ()
+                           ,a1)
                        clauses))
     ;; else
     (first clauses)))

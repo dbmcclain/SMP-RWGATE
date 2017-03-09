@@ -15,6 +15,8 @@
    #:mref
    #:atomic-incf
    #:atomic-decf
+   #:raw-car-ref
+   #:raw-cdr-ref
    ))
 |#
 
@@ -37,6 +39,10 @@
 
 (defmethod cas ((ref car-ref) old new)
   (system:compare-and-swap (car (ref-cell ref)) old new))
+
+(defmethod raw-car-ref ((cell cons))
+  (make-instance 'car-ref
+                 :cell cell))
 
 ;; -----------------------------------------
 ;; REF - a mostly read-only indirect reference cell
@@ -81,6 +87,10 @@
 (defmethod cdr-ref ((ref ref))
   (make-instance 'cdr-ref
                  :cell (ref-cell ref)))
+
+(defmethod raw-cdr-ref ((cell cons))
+  (make-instance 'cdr-ref
+                 :cell cell))
 
 (defmethod ref-value ((ref cdr-ref))
   (cdr (ref-cell ref)))
