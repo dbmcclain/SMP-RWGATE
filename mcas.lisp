@@ -15,7 +15,6 @@
    #:cdr-ref
    #:cas)
   (:export
-   #:qcas
    #:%mcas
    #:mcas
    #:mcas-read
@@ -25,84 +24,6 @@
    
 (declaim (optimize (speed 3) (safety 0) (float 0)))
 
-;; -----------------------------------------------------------------
-;; AQCAS -- (Approximate Query CAS) A CAS with a returned value of the
-;; approximate contents of a ref before CAS success/failure
-
-#||#
- ;; this version returns only an estimate of the prior ref contents
-(defun AQCAS (ref old new)
-  ;; approximate QCAS
-  (let ((sav  (ref-value ref)))
-    (cond ((cas ref old new)
-           (values t old)) ;; only time we actually know
-
-          ((eq sav old)
-           (aqcas ref old new)) ;; oops! try again
-
-          (t
-           (values nil sav)) ;; return our estimate
-          )))
-#||#
-;; -----------------------------------------------------------------
-;; QCAS -- (Query CAS) A CAS with a returned value of the actual
-;; contents of a ref before CAS success/failure
-
-(defvar +qcas-tryagain+  (gensym))
-
-(defstruct qcas
-  old new sav)
-
-(defun QCAS (ref old new)
-  (labels ((do-qcas ()
-             (let ((desc (make-qcas
-                          :old  old
-                          :new  new)))
-               (with-accessors ((sav qcas-sav)) desc
-                 (hcl:unwind-protect-blocking-interrupts-in-cleanups
-                     (progn
-                       (loop until (cas ref (setf sav (ref-value ref)) desc))
-                       (qcas-help desc))
-                   (cas ref desc sav))
-                 ))))
-    
-    (multiple-value-bind (tf v)
-        (do-qcas)
-      (cond ((eq tf +qcas-tryagain+)
-             (qcas ref old new))
-            
-            (t
-             (values tf v))
-            ))))
-
-(defun qcas-help (desc)
-  (let ((old  (qcas-old desc))
-        (new  (qcas-new desc)))
-    (with-accessors ((sav qcas-sav)) desc
-      (cond ((eq sav old)
-             (setf sav new)
-             (values t old))
-            
-            ((qcas-p sav)
-             (multiple-value-bind (tf v)
-                 (qcas-help sav)
-               (cond (tf
-                      (setf sav (qcas-sav sav))
-                      +qcas-tryagain+)
-                     
-                     ((eq old v)
-                      (setf sav new)
-                      (values t old))
-                     
-                     (t
-                      (setf sav (qcas-sav sav))
-                      (values nil v))
-                     )))
-            
-            (t
-             (values nil sav))
-            ))))
-               
 ;; ------------------
 ;; CCAS - Conditional CAS
 ;;
@@ -116,7 +37,9 @@
 ;;
 ;; If the CCAS acquires, but the condition is not met, it can only be
 ;; because another thread pushed us along to a :FAILED or :SUCCEEDED
-;; resolution already. In other words we have already been through here.
+;; resolution already. In other words we have already been through
+;; here.  So even if we successfuly CAS again, we have to set the
+;; value back to Old value.
 ;;
 
 (defstruct mcas-desc
@@ -130,47 +53,47 @@
 
 
 (defun ccas (ref old mdesc)
+  ;; CCAS -- conditional CAS
+  ;; Condition is that mdesc must be :undecided.
+  ;; Returns nothing useful.
   (declare (mcas-desc mdesc))
   
   (labels ((try-ccas (desc)
              (declare (ccas-desc desc))
-             (multiple-value-bind (t/f v)
-                 (aqcas ref old desc)
-               (cond (t/f
-                      ;;
-                      ;;               CAS succeeded
-                      ;;                     |  
-                      ;;              ref-val EQ old -> CCAS desc
-                      ;;               |     |    |                   
-                      ;;   MCAS :UNDECIDED   |   MCAS :FAILED
-                      ;;                     |
-                      ;;         MCAS :SUCCEEDED && old EQ new
-                      ;;
-                      ;; We got it! Either this is the first time
-                      ;; through with MCAS :UNDECIDED or, because the
-                      ;; old value was eq the expected old, the MCAS was
-                      ;; pushed along by another thread and the state
-                      ;; must now be :FAILED.
-                      ;;
-                      ;; (Or else, the planned new value was the same as
-                      ;; the old value and MCAS :SUCCEEDED. Either way,
-                      ;; it put back the old value.).
-                      ;;
-                      ;; In the first case, we can now replace our CCAS
-                      ;; descriptor with the caller's MCAS descriptor.
-                      ;;
-                      ;; In the second case, we must put back the old value.
-                      ;;
-                      (ccas-help desc)
-                      (values t v))
-
-                     ((ccas-desc-p v)
-                      (ccas-help v)
-                      (try-ccas desc))
-
-                     (t
-                      (values nil v))
-                     ))))
+             (cond ((cas ref old desc)
+                    ;;
+                    ;;               CAS succeeded
+                    ;;                     |  
+                    ;;              ref-val EQ old -> CCAS desc
+                    ;;               |     |    |                   
+                    ;;   MCAS :UNDECIDED   |   MCAS :FAILED
+                    ;;                     |
+                    ;;         MCAS :SUCCEEDED && old EQ new
+                    ;;
+                    ;; We got it! Either this is the first time
+                    ;; through with MCAS :UNDECIDED or, since the
+                    ;; old value was eq the expected old, the MCAS was
+                    ;; pushed along by another thread and the state
+                    ;; must now be :FAILED.
+                    ;;
+                    ;; (Or else, the planned new value was the same as
+                    ;; the old value and MCAS :SUCCEEDED. Either way,
+                    ;; it put back the old value.).
+                    ;;
+                    ;; In the first case, we can now replace our CCAS
+                    ;; descriptor with the caller's MCAS descriptor.
+                    ;;
+                    ;; In the second case, we must put back the old value.
+                    ;;
+                    (ccas-help desc))
+                     
+                   (t
+                    (let ((v (ref-value ref)))
+                      (cond ((ccas-desc-p v)
+                             (ccas-help v)
+                             (try-ccas desc))
+                            )))
+                   )))
     
     (try-ccas (make-ccas-desc
                :ref      ref
@@ -230,25 +153,26 @@
                    (return-from mcas-help success))))
 
              (acquire (ref old new)
-               (multiple-value-bind (t/f v)
-                   (ccas ref old desc)
-                 (unless t/f
-                   (cond ((eq v desc))
-                          ;; break
-                          )
-                         
-                         ((mcas-desc-p v)
-                          ;; someone else is trying, help them out, then
-                          ;; try again
-                          (mcas-help v)
-                          (acquire ref old new))
-                         
-                         (t ;; not a descriptor, and not eq old with
-                            ;; :undecided, so we must have missed our
-                            ;; chance
-                            (decide :failed))
-                         ))
-                 )))
+               (ccas ref old desc)
+               (let ((v (ccas-read ref)))
+                 (cond ((eq v desc)
+                        ;; we got it,
+                        ;; break
+                        )
+                       
+                       ((mcas-desc-p v)
+                        ;; someone else is trying, help them out, then
+                        ;; try again
+                        (mcas-help v)
+                        (acquire ref old new))
+                       
+                       (t ;; not a descriptor, and not eq old with
+                          ;; :undecided, so we must have missed our
+                          ;; chance, or else we already resolved to
+                          ;; :failed or :successful
+                          (decide :failed))
+                       ))
+               ))
 
       (when (eq :undecided (car status-ref))
         (map nil (lambda (triple)
