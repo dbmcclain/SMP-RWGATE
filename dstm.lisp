@@ -14,6 +14,7 @@
    #:ref
    #:mref
    #:ref-value
+   #:set-ref-value
    #:cas)
   (:export
    #:make-var
@@ -29,7 +30,7 @@
 
 (in-package #:dstm)
 
-(declaim (inline tstate cas-state
+(declaim (inline cas-state
                  locator-new locator-old locator-trans
                  ro-ent-var ro-ent-val ro-ent-refct
                  transaction-ro-table transaction-state)
@@ -39,16 +40,14 @@
 
 (defvar *current-transaction* nil)
 
-(defstruct transaction
-  ro-table
-  dly-table
-  (state  (list :active)))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defstruct transaction
+    ro-table
+    dly-table
+    (state  :active)))
 
-(defun tstate (trans)
-  (car (transaction-state trans)))
-
-(defun cas-state (trans old new)
-  (sys:compare-and-swap (car (transaction-state trans)) old new))
+(defmethod cas ((trans transaction) old new)
+  (sys:compare-and-swap (transaction-state trans) old new))
 
 ;; ----------------------------------------------------
 
@@ -64,7 +63,7 @@
   ((arg  :reader abort-exn-retval :initarg :retval :initform nil)))
 
 (defun dstm-error (exn)
-  (cas-state *current-transaction* :active :aborted)
+  (cas *current-transaction* :active :aborted)
   (error exn))
 
 (defun retry ()
@@ -86,15 +85,32 @@
 
 (defvar *permanently-committed*
   (make-transaction
-   :state (list :committed)))
+   :state :committed))
 
 (defstruct locator
   new old
   (trans  *permanently-committed*))
 
+;; ----------------------------------------------------
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defstruct (var
+              (:constructor %make-var))
+    loc))
+
+(defun make-var (&optional val)
+  (%make-var
+   :loc (make-locator
+         :new val)))
+
+(defmethod cas ((var var) old-loc new-loc)
+  (system:compare-and-swap (var-loc var) old-loc new-loc))
+
+#|
 (defun make-var (&optional val)
   (ref (make-locator
         :new  val)))
+|#
 
 ;; ------------------------------
 ;; All objects subject to DSTM must define a DSTM:CLONE method
@@ -112,11 +128,17 @@
 (defmethod clone ((seq sequence))
   (copy-seq seq))
 
-(defmethod clone ((s structure-class))
+(defmethod clone ((s structure-object))
   (copy-structure s))
 
 (defmethod clone ((r mref))
   (mref (ref-value r)))
+
+(defmethod clone ((v var))
+  ;; Not a good idea to clone a var
+  ;; Should always incorporate vars in some structured object
+  ;; but never as the value of another var.
+  (error "Attempt to clone a Var"))
 
 ;; ----------------------------------------------------
 
@@ -131,7 +153,7 @@
                             :test #'eq)
                       (let ((ent (make-dly-ent
                                   :var var
-                                :dly 0.001)))
+                                  :dly 0.001)))
                         (push ent dly-table)
                         ent)
                       ))
@@ -139,13 +161,13 @@
            (rdly (random dly)))
       (cond ((< dly 0.1)
              ;; be nice...
-             (sleep rdly)
+             (mp:wait-processing-events rdly)
              (setf (dly-ent-dly entry) (* dly 1.618))
              nil) ;; say no to aborting...
             
             (t 
              ;; no more Mr. Nice Guy...
-             (sleep rdly)
+             (mp:wait-processing-events rdly)
              t) ;; go ahead and abort him
             ))))
 
@@ -158,33 +180,32 @@
 (defun add-to-read-only-table (var val trans)
   (with-accessors ((ro-table  transaction-ro-table))
       *current-transaction*
-    (let ((entry  (find var ro-table
-                        :key  #'ro-ent-var
-                        :test #'eq)))
-      (cond (entry
-             ;; don't worry here about val v.s. our copy of it.
-             ;; we'll be checking consistency momentarily.
-             (unless (eq :write (ro-ent-refct entry))
-               (incf (the fixnum (ro-ent-refct entry)))))
+    (unless (eq trans *current-transaction*)
+      (let ((entry  (find var ro-table
+                          :key  #'ro-ent-var
+                          :test #'eq)))
+        (cond (entry
+               ;; don't worry here about val v.s. our copy of it.
+               ;; we'll be checking consistency momentarily.
+               (incf (the fixnum (ro-ent-refct entry))))
 
-            (t 
-             (let ((ct (if (eq trans *current-transaction*)
-                           :write
-                         1)))
+              (t 
                (push (make-ro-ent
                       :var   var
                       :val   val
-                      :refct ct)
-                     ro-table)))
-            ))))
+                      :refct 1)
+                     ro-table))
+              )))))
 
 (defun update-read-only-table-for-write (var)
   ;; if var has been opened for reading, mark it as now open for writing
   ;; prevents release-read from doing anything
-  (um:when-let (entry (find var (transaction-ro-table *current-transaction*)
-                            :key  #'ro-ent-var
-                            :test #'eq))
-    (setf (ro-ent-refct entry) :write)))
+  (with-accessors ((ro-table  transaction-ro-table))
+      *current-transaction*
+    (setf ro-table (delete var ro-table
+                           :key  #'ro-ent-var
+                           :test #'eq))
+    ))
 
 (defun validate-read-only-table ()
   ;; check that all vars opened for reading remain unchanged
@@ -197,9 +218,9 @@
 ;; -----------------------------------------------------------------
 
 (defun get-committed-val (var)
-  (let* ((loc   (ref-value var))
+  (let* ((loc   (var-loc var))
          (trans (locator-trans loc)))
-    (case (tstate trans)
+    (case (transaction-state trans)
       (:committed
        (setf (locator-old loc) nil) ;; help GC
        (values (locator-new loc) loc))
@@ -214,7 +235,7 @@
              
              ((should-abort var)
               ;; abort him and try again
-              (cas-state trans :active :aborted)
+              (cas trans :active :aborted)
               (get-committed-val var))
              
              (t
@@ -226,7 +247,7 @@
 (defun validate-transaction ()
   ;; check vars opened for reading and that we are still active
   (validate-read-only-table)
-  (unless (eq :active (tstate *current-transaction*))
+  (unless (eq :active (transaction-state *current-transaction*))
     (retry)))
 
 (defun open-for-read (var)
@@ -243,8 +264,7 @@
   (um:when-let (entry (find var ro-table
                             :key  #'ro-ent-var
                             :test #'eq))
-    (unless (or (eq :write (ro-ent-refct entry))
-                (plusp (the fixnum (decf (the fixnum (ro-ent-refct entry))))))
+    (unless (plusp (the fixnum (decf (the fixnum (ro-ent-refct entry)))))
       (setf ro-table (delete entry ro-table
                              :test  #'eq
                              :count 1)))
@@ -252,13 +272,26 @@
       
 ;; ------------------------------
 
+(defclass wref ()
+  ((loc  :reader wref-loc  :initarg :loc)))
+
+(defun wref (loc)
+  (make-instance 'wref
+                 :loc loc))
+
+(defmethod ref-value ((w wref))
+  (locator-new (wref-loc w)))
+
+(defmethod set-ref-value ((w wref) val)
+  (setf (locator-new (wref-loc w)) val))
+
 (defun open-for-write (var)
   (multiple-value-bind (old loc)
       (get-committed-val var)
     (cond ((eq (locator-trans loc) *current-transaction*)
            ;; already open-for-write by us
-           (locator-new loc))
-
+           (wref loc))
+          
           (t
            ;; try to grab with new locator
            (let* ((new     (clone old))
@@ -270,8 +303,8 @@
                     ;; we got it
                     (update-read-only-table-for-write var)
                     (validate-transaction)
-                    new)
-            
+                    (wref new-loc))
+                   
                    (t
                     ;; try again
                     (open-for-write var))
@@ -283,14 +316,14 @@
 (defun commit ()
   ;; check that no read-only vars have changed and that we are still active
   (validate-read-only-table)
-  (unless (cas-state *current-transaction* :active :committed)
+  (unless (cas *current-transaction* :active :committed)
     (retry))
   ;; we made it
   (sys:atomic-fixnum-incf *ncomms*))
 
 ;; ------------------------------
 
-(defun do-atomically (fn)
+(defun do-atomic (fn)
   (cond (*current-transaction*
          (funcall fn))
         
@@ -301,7 +334,7 @@
                         *current-transaction*
                       
                       (unwind-protect
-                          (return-from do-atomically
+                          (return-from do-atomic
                             (multiple-value-prog1
                                 (values (funcall fn) t)
                               (commit)))
@@ -334,8 +367,8 @@
 (defmacro atomic (&body body)
   ;; return (values body t) if successful
   ;; else (values nil nil) if aborted
-  `(do-atomically (lambda ()
-                    ,@body)))
+  `(do-atomic (lambda ()
+                ,@body)))
        
 ;; -------------------------------------------------
 

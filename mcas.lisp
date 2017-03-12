@@ -43,7 +43,8 @@
 ;;
 
 (defstruct mcas-desc
-  triples status)
+  triples
+  (status   (list :undecided)))
 
 (defmacro mstatus (mdesc)
   `(car (mcas-desc-status ,mdesc)))
@@ -131,8 +132,7 @@
 (defun %mcas (triples)
   ;; triples - a sequence of (ref old new) suitable for CAS
   (mcas-help (make-mcas-desc
-              :triples triples
-              :status  (list :undecided))))
+              :triples triples)))
 
 (defmacro mcas (&rest terms)
   `(%mcas (um:triples ,@terms)))
@@ -141,46 +141,49 @@
   (declare (mcas-desc desc))
   (let ((triples       (mcas-desc-triples desc))
         (status-ref    (mcas-desc-status desc)))
-    
-    (labels ((decide (desired-state)
-               (sys:compare-and-swap (car status-ref) :undecided desired-state)
-               (let ((success (eq :successful (car status-ref))))
-                 (labels ((patch-up (ref old new)
-                            (cas ref desc (if success new old))))
-                   (map nil (lambda (triple)
-                              (apply #'patch-up triple))
-                        triples)
-                   (return-from mcas-help success))))
 
-             (acquire (ref old new)
-               (ccas ref old desc)
-               (let ((v (ccas-read ref)))
-                 (cond ((eq v desc)
-                        ;; we got it,
-                        ;; break
-                        )
+    (symbol-macrolet ((status (car status-ref)))
+      
+      (labels ((decide (desired-state)
+                 (sys:compare-and-swap status :undecided desired-state)
+                 (let ((success (eq :successful status)))
+                   (labels ((patch-up (ref old new)
+                              (cas ref desc (if success new old))))
+                     (map nil (lambda (triple)
+                                (apply #'patch-up triple))
+                          triples)
+                     (return-from mcas-help success))))
+               
+               (acquire (ref old new)
+                 (ccas ref old desc)
+                 (let ((v (ccas-read ref)))
+                   (cond ((eq v desc)
+                          ;; we got it,
+                          ;; break
+                          )
+                         
+                         ((mcas-desc-p v)
+                          ;; someone else is trying, help them out, then
+                          ;; try again
+                          (mcas-help v)
+                          (acquire ref old new))
                        
-                       ((mcas-desc-p v)
-                        ;; someone else is trying, help them out, then
-                        ;; try again
-                        (mcas-help v)
-                        (acquire ref old new))
-                       
-                       (t ;; not a descriptor, and not eq old with
-                          ;; :undecided, so we must have missed our
-                          ;; chance, or else we already resolved to
-                          ;; :failed or :successful
-                          (decide :failed))
-                       ))
-               ))
-
-      (when (eq :undecided (car status-ref))
-        (map nil (lambda (triple)
-                   (apply #'acquire triple))
-             triples))
-      (decide :successful)
-      )))
-
+                         (t ;; not a descriptor, and not eq old with
+                            ;; :undecided, so we must have missed our
+                            ;; chance, or else we already resolved to
+                            ;; :failed or :successful, and this will
+                            ;; have no effect.
+                            (decide :failed))
+                         ))
+                 ))
+        
+        (when (eq :undecided status)
+          (map nil (lambda (triple)
+                     (apply #'acquire triple))
+               triples))
+        (decide :successful)
+        ))))
+  
 (defun mcas-read (ref)
   (let ((v (ccas-read ref)))
     (cond ((mcas-desc-p v)

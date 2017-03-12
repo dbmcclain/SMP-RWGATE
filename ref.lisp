@@ -34,11 +34,14 @@
 (defclass car-ref (ref-mixin)
   ())
 
+(defmethod ref-value (x)
+  x)
+
 (defmethod ref-value ((ref car-ref))
-  (car (ref-cell ref)))
+  (car (the cons (ref-cell ref))))
 
 (defmethod cas ((ref car-ref) old new)
-  (system:compare-and-swap (car (ref-cell ref)) old new))
+  (system:compare-and-swap (car (the cons (ref-cell ref))) old new))
 
 (defmethod raw-car-ref ((cell cons))
   (make-instance 'car-ref
@@ -69,15 +72,15 @@
                  :cell (list x)))
 
 (defmethod set-ref-value ((ref mref) val)
-  (setf (car (ref-cell ref)) val))
+  (setf (car (the cons (ref-cell ref))) val))
 
 (defsetf ref-value set-ref-value)
 
 (defmethod atomic-incf ((ref mref))
-  (system:atomic-fixnum-incf (car (ref-cell ref))))
+  (system:atomic-fixnum-incf (car (the cons (ref-cell ref)))))
 
 (defmethod atomic-decf ((ref mref))
-  (system:atomic-fixnum-decf (car (ref-cell ref))))
+  (system:atomic-fixnum-decf (car (the cons (ref-cell ref)))))
 
 ;; -----------------------------------------
 
@@ -93,14 +96,8 @@
                  :cell cell))
 
 (defmethod ref-value ((ref cdr-ref))
-  (cdr (ref-cell ref)))
+  (cdr (the cons (ref-cell ref))))
 
 (defmethod cas ((ref cdr-ref) old new)
-  (system:compare-and-swap (cdr (ref-cell ref)) old new))
-
-(defmethod atomic-incf ((ref cdr-ref))
-  (system:atomic-fixnum-incf (cdr (ref-cell ref))))
-
-(defmethod atomic-decf ((ref cdr-ref))
-  (system:atomic-fixnum-decf (cdr (ref-cell ref))))
+  (system:compare-and-swap (cdr (the cons (ref-cell ref))) old new))
 
