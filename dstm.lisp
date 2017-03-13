@@ -106,12 +106,6 @@
 (defmethod cas ((var var) old-loc new-loc)
   (system:compare-and-swap (var-loc var) old-loc new-loc))
 
-#|
-(defun make-var (&optional val)
-  (ref (make-locator
-        :new  val)))
-|#
-
 ;; ------------------------------
 ;; All objects subject to DSTM must define a DSTM:CLONE method
 ;;

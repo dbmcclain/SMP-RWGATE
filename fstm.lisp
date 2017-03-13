@@ -14,10 +14,8 @@
 (defpackage #:fstm
   (:use #:common-lisp)
   (:import-from #:ref
-   #:ref
    #:mref
    #:ref-value
-   #:cas
    #:atomic-incf)
   (:export
    #:make-var
@@ -40,18 +38,19 @@
 (defvar *tid-counter*  0)
 
 (defun next-tid ()
-  (sys:atomic-fixnum-incf *tid-counter*))
+  (sys:atomic-fixnum-incf (the fixnum *tid-counter*)))
 
 (defvar *vid-counter*  0)
 
 (defun next-vid ()
-  (sys:atomic-fixnum-incf *vid-counter*))
+  (sys:atomic-fixnum-incf (the fixnum *vid-counter*)))
 
-(defstruct transaction
-  (id      (next-tid))
-  (state   (list :undecided))
-  ro-list
-  (rw-map  (maps:empty)))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defstruct transaction
+    (id      (next-tid))
+    (state   :undecided)
+    ro-list
+    (rw-map  (maps:empty))))
 
 (defvar *ncomms*  0)  ;; cumm nbr successful commits
 (defvar *nrolls*  0)  ;; cumm nbr retrys
@@ -81,17 +80,14 @@
 
 ;; ----------------------------------------------------
 
-(defstruct (var
-            (:constructor %make-var))
-  (id  (next-vid))
-  ref)
-
-(defun make-var (&optional val)
-  (%make-var
-   :ref  (list val)))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defstruct (var
+              (:constructor make-var (&optional val)))
+    (id  (next-vid))
+    val))
 
 ;; ------------------------------
-;; All objects subject to DSTM must define a DSTM:CLONE method
+;; All objects subject to FSTM must define a FSTM:CLONE method
 ;;
 ;; CLONE is called when opening for write access.
 ;;
@@ -106,24 +102,26 @@
 (defmethod clone ((seq sequence))
   (copy-seq seq))
 
-(defmethod clone ((s structure-class))
+(defmethod clone ((s structure-object))
   (copy-structure s))
 
 (defmethod clone ((r mref))
   (mref (ref-value r)))
 
+(defmethod clone ((v var))
+  ;; Not a good idea to clone a var
+  ;; Should always incorporate vars in some structured object
+  ;; but never as the value of another var.
+  (error "Attempt to clone a VAR"))
+
 ;; ----------------------------------------------------
 
-(declaim (inline trans< tstate))
+(declaim (inline trans<))
 
 (defun trans< (trans1 trans2)
   (declare (type transaction trans1 trans2))
   (< (the fixnum (transaction-id trans1))
      (the fixnum (transaction-id trans2))))
-
-(defun tstate (trans)
-  (declare (type transaction trans))
-  (car (transaction-state trans)))
 
 ;; -------------------------------------------------------------------
 
@@ -156,12 +154,13 @@
 ;; its commit.
 
 (defun maybe-help (trans other-trans)
-  (when (eq :read-phase (tstate other-trans))
+  (declare (transaction trans other-trans))
+  (when (eq :read-phase (transaction-state other-trans))
     ;; other-trans is in the :read-phase of a commit
-    (cond ((and (eq :read-phase (tstate trans)) ;; are we in :read-phase of commit too?
+    (cond ((and (eq :read-phase (transaction-state trans)) ;; are we in :read-phase of commit too?
                 (trans< trans other-trans))     ;; and are we older?
            ;; we are older - abort him
-           (sys:compare-and-swap (car (transaction-state other-trans)) :read-phase :failed))
+           (sys:compare-and-swap (transaction-state other-trans) :read-phase :failed))
 
           (t ;; either we are not in a commit, or we are younger
            (commit-transaction other-trans))
@@ -169,13 +168,15 @@
 
 ;; --------------------------------------
 
-(defun obj-read(trans var)
-  (let ((data (car (var-ref var))))
+(defun obj-read (trans var)
+  (declare (transaction trans)
+           (var var))
+  (let ((data (var-val var)))
     (when (transaction-p data)
-      (let ((entry (maps:find (var-id var) (transaction-rw-map data))))
+      (let ((entry (maps:find (var-id var) (transaction-rw-map (the transaction data)))))
         (maybe-help trans data)
-        (setf data (if (eq :successful (tstate data))
-                       (third entry)  ;; new
+        (setf data (if (eq :successful (transaction-state data))
+                       (ref-value (the mref (third entry)))  ;; new
                      (second entry))) ;; old
         ))
     data))
@@ -183,33 +184,36 @@
 ;; --------------------------------------
 
 (defun commit-transaction (trans)
-  (let ((state-ref     (transaction-state trans))
-        (rw-map        (transaction-rw-map trans))
-        (desired-state :failed))
-    
-    (labels ((get-status ()
-               (let ((state (car state-ref)))
+  (declare (transaction trans))
+  (let ((rw-map  (transaction-rw-map trans)))
+
+    (labels ((get-status (desired-state)
+               (let ((state (transaction-state trans)))
                  (case state
                    (:failed     nil)
                    (:successful t)
                    (t
-                    (sys:compare-and-swap (car state-ref) state desired-state)
-                    (get-status))
+                    (sys:compare-and-swap (transaction-state trans) state desired-state)
+                    (get-status desired-state))
                    )))
              
-             (decide ()
-               (let ((success (get-status)))
-                 (labels ((restore (var old new)
-                            (sys:compare-and-swap (car (var-ref var)) trans (if success new old))))
+             (decide (desired-state)
+               (let ((success (get-status desired-state)))
+                 (labels ((restore (var old new-ref)
+                            (sys:compare-and-swap (var-val var)
+                                                  trans
+                                                  (if success
+                                                      (ref-value (the mref new-ref))
+                                                    old))))
                    (maps:iter #'(lambda (k v)
                                   (declare (ignore k))
                                   (apply #'restore v))
                               rw-map)
                    (return-from commit-transaction success))))
 
-             (acquire (var old new)
-               (unless (sys:compare-and-swap (car (var-ref var)) old trans)
-                 (let ((data (car (var-ref var))))
+             (acquire (var old new-ref)
+               (unless (sys:compare-and-swap (var-val var) old trans)
+                 (let ((data (var-val var)))
                    (cond ((eq data trans)
                           ;; break
                           )
@@ -217,65 +221,70 @@
                          ((transaction-p data)
                           ;; someone else is committing, help them out
                           (commit-transaction data)
-                          (acquire var old new))
+                          (acquire var old new-ref))
                          
                          (t
                           ;; didn't get it, can't get it
-                          (decide))
+                          (decide :failed))
                          )))))
 
-      (when (eq :undecided (car state-ref))
+      (when (eq :undecided (transaction-state trans))
         (maps:iter #'(lambda (k v)
                        (declare (ignore k))
                        (apply #'acquire v))
                    rw-map)
-        (sys:compare-and-swap (car state-ref) :undecided :read-phase))
-      (when (eq :read-phase (car state-ref))
-        (loop for (var val) in (transaction-ro-list trans) do
+        (sys:compare-and-swap (transaction-state trans) :undecided :read-phase))
+      (when (eq :read-phase (transaction-state trans))
+        (loop for (var val) in (the list (transaction-ro-list trans)) do
               (unless (eq val (obj-read trans var))
-                (decide)))
-        (setf desired-state :successful))
-      (decide)
+                (decide :failed))))
+      (decide :successful)
       )))
 
 ;; -------------------------------------------------------------------------
 ;; operations on *CURRENT-TRANSACTION*
 
 (defun open-for-read (var)
+  (declare (var var))
   (let ((data (obj-read *current-transaction* var)))
-    (push (list var data) (transaction-ro-list *current-transaction*))
+    (push (list var data)
+          (transaction-ro-list (the transaction *current-transaction*)))
     data))
 
 (defun open-for-write (var)
-  (let ((triple (maps:find (var-id var) (transaction-rw-map *current-transaction*))))
+  (declare (var var))
+  (let ((triple (maps:find (var-id var)
+                           (transaction-rw-map (the transaction *current-transaction*)))))
     (cond (triple
-           (third triple)) ;; current new value
+           (third triple)) ;; mref of current new value
           
           (t
-           (let* ((pair  (find var (transaction-ro-list *current-transaction*)
+           (let* ((pair  (find var (the list (transaction-ro-list
+                                              (the transaction *current-transaction*)))
                                :key  #'first
                                :test #'eq))
                   (old (cond (pair
-                              (setf (transaction-ro-list *current-transaction*)
-                                    (delete var (transaction-ro-list *current-transaction*)
+                              (setf (transaction-ro-list (the transaction *current-transaction*))
+                                    (delete var (the list (transaction-ro-list
+                                                           (the transaction *current-transaction*)))
                                             :key  #'first
                                             :test #'eq))
-                              (second pair)) ;; current val
+                              (second (the cons pair))) ;; current val
                    
                              (t
                               (obj-read *current-transaction* var))
                              ))
-                  (new  (clone old)))
-             (setf (transaction-rw-map *current-transaction*)
-                   (maps:add (var-id var) (list var old new)
-                             (transaction-rw-map *current-transaction*)))
-             new))
+                  (new-ref  (mref (clone old))))
+             (setf (transaction-rw-map (the transaction *current-transaction*))
+                   (maps:add (var-id var) (list var old new-ref)
+                             (transaction-rw-map (the transaction *current-transaction*))))
+             new-ref))
           )))
 
 (defun release-read (var)
   ;; releasing a var that was never opened is a benign error
-  (setf (transaction-ro-list *current-transaction*)
-        (delete var (transaction-ro-list *current-transaction*)
+  (setf (transaction-ro-list (the transaction *current-transaction*))
+        (delete var (the list (transaction-ro-list (the transaction *current-transaction*)))
                 :key   #'first
                 :test  #'eq
                 :count 1)))
@@ -287,36 +296,38 @@
 
 ;; ------------------------------
 
-(defun do-atomically (fn)
+(defun do-atomic (fn)
   (cond (*current-transaction*
          (funcall fn))
         
         (t
-         (handler-case
-             (loop
-              (let ((*current-transaction* (make-transaction)))
-                (handler-case
-                    (return-from do-atomically
+         (labels ((try-transaction ()
+                    (return-from do-atomic
                       (multiple-value-prog1
                           (values (funcall fn) t)
-                        (commit)))
-                  
-                  (retry-exn (exn)
-                    (declare (ignore exn))
-                    ;; try again from the top
-                    )
-                  )))
-           
-           (abort-exn (exn)
-             (values (abort-exn-retval exn) nil))
-           ))
+                        (commit))))
+
+                  (retry-loop ()
+                    (let ((*current-transaction* (make-transaction)))
+                      (handler-case
+                          (try-transaction)
+                        (retry-exn (exn)
+                          (declare (ignore exn))
+                          (retry-loop))
+                        ))))
+
+           (handler-case
+               (retry-loop)
+             (abort-exn (exn)
+               (values (abort-exn-retval exn) nil))
+             )))
         ))
   
 (defmacro atomic (&body body)
   ;; return (values body t) if successful
   ;; else (values nil nil) if aborted
-  `(do-atomically (lambda ()
-                    ,@body)))
+  `(do-atomic (lambda ()
+                ,@body)))
        
 ;; -------------------------------------------------
 
@@ -338,13 +349,13 @@
     (setf *nrolls* 0)
     (setf *ncomms* 0))
   
-  (defvar *a* (make-var (list 0)))
-  (defvar *b* (make-var (list 0)))
+  (defvar *a* (make-var 0))
+  (defvar *b* (make-var 0))
   
   (defun check-invariant (&aux a b)
     (atomic
-      (setf a (car (open-for-read *a*))
-            b (car (open-for-read *b*))
+      (setf a (open-for-read *a*)
+            b (open-for-read *b*)
             ))
     (if (= b (* 2 a))
         (format t "~%a = ~A, b = ~A  (~A)" a b mp:*current-process*)
@@ -352,12 +363,12 @@
   
   (defun common-code (delta)
     (atomic
-      (let* ((lsta (open-for-write *a*))
-             (lstb (open-for-write *b*))
-             (a    (+ delta (car lsta)))
+      (let* ((refa (open-for-write *a*))
+             (refb (open-for-write *b*))
+             (a    (+ delta (ref-value refa)))
              (b    (* 2 a)))
-        (setf (car lsta) a
-              (car lstb) b)
+        (setf (ref-value refa) a
+              (ref-value refb) b)
         )))
 
   (defvar *ct* 1000)
@@ -380,9 +391,9 @@
         (bfly:log-info :SYSTEM-LOG (show-rolls (* 1e-6 (- stop start))))) ))
   
   (defun tst0 ()
-    (bfly:log-info :SYSTEM-LOG "Start HDSTM Test...")
-    (setf *a* (make-var (list 0))
-          *b* (make-var (list 0)))
+    (bfly:log-info :SYSTEM-LOG "Start FSTM Test...")
+    (setf *a* (make-var 0)
+          *b* (make-var 0))
     (reset)
     (bfly:spawn #'checker
                 :name :checker
@@ -396,8 +407,8 @@
   (defun tst1 (&optional (ct 100000))
     ;; only one thread for no-contention timings
     (setf *ct* ct)
-    (setf *a* (make-var (list 0))
-          *b* (make-var (list 0)))
+    (setf *a* (make-var 0)
+          *b* (make-var 0))
     (reset)
     (let ((start (usec:get-time-usec)))
       (count-down)
@@ -407,8 +418,8 @@
   
   (defun tst2 (&optional (ct 100000))
     (setf *ct* ct)
-    (setf *a* (make-var (list 0))
-          *b* (make-var (list 0)))
+    (setf *a* (make-var 0)
+          *b* (make-var 0))
     (reset)
     (let ((start (usec:get-time-usec))
           (ct 0)
@@ -431,8 +442,8 @@
 
   (defun tst3 (&optional (ct 100000))
     (setf *ct* ct)
-    (setf *a* (make-var (list 0))
-          *b* (make-var (list 0)))
+    (setf *a* (make-var 0)
+          *b* (make-var 0))
     (reset)
     (let ((start (usec:get-time-usec))
           (ct 0)
@@ -460,8 +471,8 @@
 
   (defun tst4 ()
     ;; only one thread for no-contention timings
-    (setf *a* (make-var (list 0))
-          *b* (make-var (list 0)))
+    (setf *a* (make-var 0)
+          *b* (make-var 0))
     (reset)
     (let ((start (usec:get-time-usec))
           (ct 0)
